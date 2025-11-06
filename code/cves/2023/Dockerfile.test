@@ -1,0 +1,100 @@
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies and runtime tools
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    git \
+    wget \
+    faketime \
+    libboost-all-dev \
+    libssl-dev \
+    libpng-dev \
+    libqrencode-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build the REAL vulnerable bx version 3.2.0 from source
+# This is the ACTUAL vulnerable code that was exploited in the wild
+# CVE-2023-39910: Uses MT19937 PRNG seeded with only 32 bits of time
+WORKDIR /build
+
+# Clone libbitcoin-system (dependency) - version3 branch for compatibility
+RUN git clone https://github.com/libbitcoin/libbitcoin-system.git \
+    && cd libbitcoin-system \
+    && git checkout version3 \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig
+
+# Clone and build libbitcoin-explorer v3.2.0 (vulnerable version)
+RUN git clone https://github.com/libbitcoin/libbitcoin-explorer.git \
+    && cd libbitcoin-explorer \
+    && git checkout v3.2.0 \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr/local --with-qrencode \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig
+
+# Verify the vulnerable version is installed
+RUN bx --version
+
+WORKDIR /test
+
+# Create test script
+RUN echo '#!/bin/bash\n\
+echo "==================================="\n\
+echo "CVE-2023-39910 Real Vulnerability Test"\n\
+echo "==================================="\n\
+echo ""\n\
+echo "1. Checking bx version:"\n\
+bx --version\n\
+echo ""\n\
+echo "2. Testing deterministic seed generation (PROOF OF VULNERABILITY):"\n\
+echo "   Generating seed at epoch 0 (1970-01-01 00:00:00) - twice:"\n\
+seed1=$(faketime "1970-01-01 00:00:00" bx seed -b 256)\n\
+echo "   Seed 1: $seed1"\n\
+seed2=$(faketime "1970-01-01 00:00:00" bx seed -b 256)\n\
+echo "   Seed 2: $seed2"\n\
+echo ""\n\
+if [ "$seed1" = "$seed2" ]; then\n\
+    echo "   ❌ VULNERABLE: Seeds are IDENTICAL (deterministic)"\n\
+    echo "   This proves weak entropy - attacker can brute-force all seeds!"\n\
+else\n\
+    echo "   ✅ Not vulnerable: Seeds are different"\n\
+fi\n\
+echo ""\n\
+echo "3. Testing the famous '\''Milk Sad'\'' mnemonic:"\n\
+echo "   Generating BIP39 mnemonic at epoch 0:"\n\
+mnemonic=$(faketime "1970-01-01 00:00:00" bash -c "bx seed -b 256 | bx mnemonic-new")\n\
+echo "   Result: $mnemonic"\n\
+echo ""\n\
+if echo "$mnemonic" | grep -q "^milk sad"; then\n\
+    echo "   ❌ CONFIRMED VULNERABLE: Got the '\''milk sad'\'' mnemonic!"\n\
+    echo "   This is the exact known weak seed from CVE-2023-39910"\n\
+else\n\
+    echo "   ✅ Different mnemonic - may not be vulnerable"\n\
+fi\n\
+echo ""\n\
+echo "4. Testing without faketime (timing-based):"\n\
+echo "   Generating 3 seeds rapidly:"\n\
+for i in 1 2 3; do\n\
+    seed=$(bx seed -b 256)\n\
+    echo "   Seed $i: ${seed:0:32}..."\n\
+done\n\
+echo ""\n\
+echo "==================================="\n\
+echo "TEST COMPLETE"\n\
+echo "==================================="\n\
+' > /test/run_test.sh && chmod +x /test/run_test.sh
+
+CMD ["/test/run_test.sh"]
